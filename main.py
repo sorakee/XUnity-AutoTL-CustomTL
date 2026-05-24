@@ -1,133 +1,212 @@
 from flask import Flask, request, jsonify, Response
-from google import genai
-from google.genai import types
 import json
 import os
 import re
+import requests
+import argparse
+import sys
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-def load_api_key():
-    # Try secrets.json first
+# ---------------------------------------------------------------------------
+# Command‑line argument parsing (at startup, before any request)
+# ---------------------------------------------------------------------------
+parser = argparse.ArgumentParser(
+    description="Translation Server with multiple LLM backends"
+)
+parser.add_argument(
+    "--provider",
+    choices=["openrouter", "deepseek"],
+    default="openrouter",
+    help="Which API provider to use (default: openrouter)",
+)
+parser.add_argument(
+    "--model",
+    default=None,
+    help="Override the default model name for the chosen provider",
+)
+parser.add_argument(
+    "--api-key",
+    default=None,
+    help="API key for the provider (can also be set via env var or secrets.json)",
+)
+args = parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Provider configuration
+# ---------------------------------------------------------------------------
+PROVIDER_CONFIG = {
+    "openrouter": {
+        "api_base": "https://openrouter.ai/api/v1",
+        "default_model": "google/gemini-2.5-flash",
+        "env_key_name": "OPENROUTER_API_KEY",
+        "extra_headers": {
+            "HTTP-Referer": "http://127.0.0.1:5000",
+            "X-Title": "Gemini OpenRouter Translator",
+        },
+    },
+    "deepseek": {
+        "api_base": "https://api.deepseek.com",
+        "default_model": "deepseek-chat",
+        "env_key_name": "DEEPSEEK_API_KEY",
+        "extra_headers": {},
+    },
+}
+
+provider = args.provider
+config = PROVIDER_CONFIG[provider]
+
+# Determine the model
+model = args.model if args.model else config["default_model"]
+
+# Resolve API key: command line > environment variable > secrets.json fallback
+API_KEY = args.api_key
+if not API_KEY:
+    API_KEY = os.environ.get(config["env_key_name"])
+
+if not API_KEY:
+    # Fallback to secrets.json (check both possible keys)
     try:
         with open("secrets.json", "r") as f:
-            return json.load(f).get("GEMINI_API_KEY")
+            secrets = json.load(f)
+            API_KEY = secrets.get(config["env_key_name"]) or secrets.get(
+                "GEMINI_API_KEY"
+            )
     except Exception:
-        # Fall back to env variable
-        return os.environ.get("OPENROUTER_API_KEY")
+        pass
+
+if not API_KEY:
+    print(
+        f"ERROR: No API key found for provider '{provider}'."
+        f" Please set {config['env_key_name']} or provide --api-key."
+    )
+    sys.exit(1)
+
+# Common headers for API requests
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json",
+    **config["extra_headers"],
+}
 
 
-# Configuration
-API_KEY = load_api_key()  # Your API key
-client = genai.Client(api_key=API_KEY)
-
-
+# ---------------------------------------------------------------------------
+# Translation prompt (unchanged)
+# ---------------------------------------------------------------------------
 def create_translation_prompt(text, target_lang="en", source_lang="ja"):
-    """Create translation prompt based on language pair"""
-    
     lang_names = {
         "zh": "Chinese",
-        "en": "English", 
+        "en": "English",
         "ja": "Japanese",
         "ko": "Korean",
         "es": "Spanish",
         "fr": "French",
-        "de": "German"
+        "de": "German",
     }
-    
     source_name = lang_names.get(source_lang, source_lang)
     target_name = lang_names.get(target_lang, target_lang)
     return f"""You are a professional {source_name}-to-{target_name} translator.
-
         Retain honorifics.
-        Preserve tone, emotion and nuances when possible. 
+        Preserve tone, emotion and nuances when possible.
         You must return the result only.
 
         Translate the following {source_name} text into natural {target_name}:
         {text}"""
 
-@app.route('/translate', methods=['GET'])
+
+# ---------------------------------------------------------------------------
+# Core translation function (no HTTP parameter changes)
+# ---------------------------------------------------------------------------
+def call_translation_api(prompt):
+    """Calls the selected provider's chat completions endpoint."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.4,
+    }
+    url = f"{config['api_base']}/chat/completions"
+    response = requests.post(url, headers=HEADERS, json=payload)
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("choices"):
+        error_message = data.get("error", {}).get("message", "No choices in response")
+        raise Exception(f"API error: {error_message}")
+
+    return data["choices"][0]["message"]["content"].strip()
+
+
+# ---------------------------------------------------------------------------
+# Routes (unchanged signatures)
+# ---------------------------------------------------------------------------
+@app.route("/translate", methods=["GET"])
 def translate():
-    """Standard translation endpoint"""
     try:
-        text = request.args.get('text', '').strip()
-        target_lang = request.args.get('lang', 'en')
-        source_lang = request.args.get('source', 'jp')
-        
+        text = request.args.get("text", "").strip()
+        target_lang = request.args.get("lang", "en")
+        source_lang = request.args.get("source", "ja")
+
         if not text:
-            return "No text provided"
-        
-        # Create prompt
+            return "No text provided", 400
+
         prompt = create_translation_prompt(text, target_lang, source_lang)
-        
-        # Generate translation
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                # Disable Thinking
-                thinking_config=types.ThinkingConfig(thinking_budget=0)
-            )
-        )
-        
-        # Check if response was blocked
-        if not response.text:
-            if response.prompt_feedback:
-                return "Content was blocked"
-            else:
-                return "No response was generated"
-        
-        translation = response.text.strip()
-        
-        # Clean up translation (remove markers if present)
-        translation = re.sub(r'<Start>|<End>', '', translation).strip()
-
+        translation = call_translation_api(prompt)
+        # Clean markers just in case
+        translation = re.sub(r"<Start>|<End>", "", translation).strip()
         return translation
+
+    except requests.exceptions.RequestException as e:
+        return f"Error communicating with API: {e}", 500
     except Exception as e:
-        return "Unknown error"
+        return f"An unexpected error occurred: {e}", 500
 
-@app.route('/translate/stream', methods=['POST'])
+
+@app.route("/translate/stream", methods=["POST"])
 def translate_stream():
-    """Streaming translation endpoint"""
-    return "API Endpoint WIP"
+    return "Streaming endpoint is WIP (can be implemented for both providers).", 501
 
-@app.route('/models', methods=['GET'])
+
+@app.route("/models", methods=["GET"])
 def get_models():
-    """Get available models"""
-    return jsonify({
-        'models': [
-            {
-                'id': 'flash',
-                'name': 'Gemini 2.5 Flash',
-                'description': 'Latest and fastest model for real-time translation',
-                'version': 'gemini-2.5-flash'
-            }
-        ]
-    })
+    return jsonify(
+        {
+            "models": [
+                {
+                    "id": model,
+                    "name": f"{provider.capitalize()} - {model}",
+                    "description": f"Active model via {provider} API",
+                    "version": model,
+                }
+            ]
+        }
+    )
+
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
+    return jsonify({"error": "Endpoint not found"}), 404
+
 
 @app.errorhandler(500)
 def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
+    return jsonify({"error": "Internal server error"}), 500
 
-if __name__ == '__main__':
-    print("🚀 Starting Gemini Translation Server...")
+
+# ---------------------------------------------------------------------------
+# Startup info
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print(
+        f"🚀 Starting Translation Server using {provider.upper()} API (model: {model})"
+    )
     print("📋 Endpoints:")
-    print("  GET/POST /translate - Standard translation")
-    print("  POST /translate/stream - Streaming translation")
-    print("  GET /models - Available models")
+    print("  GET /translate - Standard translation")
+    print("  POST /translate/stream - Streaming (WIP)")
+    print("  GET /models - Active model info")
     print()
-    print("💡 Example usage:")
+    print("💡 Example:")
     print("  curl 'http://127.0.0.1:5000/translate?text=こんにちは&lang=en'")
-    print("  curl -X POST http://127.0.0.1:5000/translate -H 'Content-Type: application/json' -d '{\"text\":\"こんにちは\",\"lang\":\"en\"}'")
     print()
-    print("🔄 For streaming:")
-    print("  curl -X POST http://127.0.0.1:5000/translate/stream -H 'Content-Type: application/json' -d '{\"text\":\"長いテキスト\",\"lang\":\"en\"}' --no-buffer")
-    print()
-    
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000, debug=True)
