@@ -1,4 +1,4 @@
-# XUnity-AutoTL-CustomTL
+# UniTLServer
 
 Host your own Flask server locally to translate text from Unity games via [XUnity-Auto-Translator](https://github.com/bbepis/XUnity.AutoTranslator) using a modern LLM (Gemini 2.5 Flash, DeepSeek, or any OpenAI‑compatible API).
 
